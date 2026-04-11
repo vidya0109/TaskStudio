@@ -3,7 +3,10 @@ import { API_BASE_URL } from "../../utils/env";
 
 const httpClient = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 10000
+  timeout: 10000,
+  headers: {
+    "ngrok-skip-browser-warning": "true"
+  }
 });
 
 httpClient.interceptors.response.use(

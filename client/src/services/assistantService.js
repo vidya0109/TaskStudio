@@ -35,7 +35,10 @@ export async function streamAskCodebase({
   const endpoint = mode === "agent" ? "/ai/agent/stream" : "/ai/ask/stream";
   const response = await fetch(`${API_BASE_URL}${endpoint}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "ngrok-skip-browser-warning": "true"
+    },
     body: JSON.stringify({ question })
   });
 
