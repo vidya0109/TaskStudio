@@ -13,7 +13,10 @@ const env = {
   // Phase 1 semantic retrieval — same API key/base URL as chat; model is embeddings-only.
   openAiEmbeddingModel:
     process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-3-small",
-  databaseUrl: process.env.DATABASE_URL || `postgresql://${process.env.USER || "postgres"}@localhost:5432/taskstudio`
+  databaseUrl: process.env.DATABASE_URL || `postgresql://${process.env.USER || "postgres"}@localhost:5432/taskstudio`,
+  githubToken: process.env.GITHUB_TOKEN || "",
+  githubRepo: process.env.GITHUB_REPO || "",
+  githubBranch: process.env.GITHUB_BRANCH || "main"
 };
 
 

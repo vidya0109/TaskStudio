@@ -3,11 +3,10 @@ import {
   Alert,
   Box,
   Button,
+  Chip,
   CircularProgress,
   Divider,
   Drawer,
-  ToggleButton,
-  ToggleButtonGroup,
   Stack,
   TextField,
   Typography
@@ -17,26 +16,30 @@ import {
   streamAskCodebase
 } from "../../services/assistantService";
 
+const CONFIDENCE_COLORS = {
+  High: "success",
+  Medium: "warning",
+  Low: "error"
+};
+
 export default function AIAssistantDrawer({ open, onClose, onDisableAssistant }) {
   const [question, setQuestion] = useState("");
-  const [answer, setAnswer] = useState("");
-  const [sources, setSources] = useState([]);
+  const [rawTokens, setRawTokens] = useState("");
+  const [parsedAnswer, setParsedAnswer] = useState(null);
+  const [indexMessage, setIndexMessage] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
   const [isIndexing, setIsIndexing] = useState(false);
   const [isAsking, setIsAsking] = useState(false);
-  const [askMode, setAskMode] = useState("rag");
 
   async function handleIndexCodebase() {
     try {
       setErrorMessage("");
+      setIndexMessage("");
       setIsIndexing(true);
       const response = await indexCodebase();
-      setAnswer(
-        `Indexed successfully. Files: ${response?.data?.fileCount ?? 0}, Chunks: ${
-          response?.data?.chunkCount ?? 0
-        }`
+      setIndexMessage(
+        `Indexed successfully — ${response?.data?.fileCount ?? 0} files, ${response?.data?.chunkCount ?? 0} chunks`
       );
-      setSources([]);
     } catch (error) {
       setErrorMessage(error.message || "Failed to index codebase");
     } finally {
@@ -46,7 +49,6 @@ export default function AIAssistantDrawer({ open, onClose, onDisableAssistant })
 
   async function handleAsk() {
     const trimmedQuestion = question.trim();
-
     if (!trimmedQuestion) {
       setErrorMessage("Please enter a question");
       return;
@@ -55,23 +57,29 @@ export default function AIAssistantDrawer({ open, onClose, onDisableAssistant })
     try {
       setErrorMessage("");
       setIsAsking(true);
-      setAnswer("");
-      setSources([]);
+      setRawTokens("");
+      setParsedAnswer(null);
 
       await streamAskCodebase({
         question: trimmedQuestion,
-        mode: askMode,
         onToken: (token) => {
-          setAnswer((prev) => prev + token);
+          setRawTokens((prev) => prev + token);
         },
-        onSources: (nextSources) => {
-          setSources(nextSources);
-        },
-        onDone: (finalAnswer) => {
-          if (!finalAnswer) {
-            return;
-          }
-          setAnswer((prev) => (prev.trim() ? prev : finalAnswer));
+        onSources: () => {},
+        onDone: () => {
+          setRawTokens((accumulated) => {
+            try {
+              setParsedAnswer(JSON.parse(accumulated));
+            } catch {
+              setParsedAnswer({
+                answer: [accumulated || "No answer generated."],
+                codePointers: [],
+                confidence: "Low",
+                confidenceReason: "Could not parse structured response"
+              });
+            }
+            return accumulated;
+          });
         },
         onError: (message) => {
           setErrorMessage(message || "Failed to stream AI answer");
@@ -95,21 +103,6 @@ export default function AIAssistantDrawer({ open, onClose, onDisableAssistant })
             Ask questions about your codebase using indexed project context.
           </Typography>
 
-          <ToggleButtonGroup
-            size="small"
-            value={askMode}
-            exclusive
-            onChange={(_event, value) => {
-              if (value) {
-                setAskMode(value);
-              }
-            }}
-            aria-label="assistant-mode"
-          >
-            <ToggleButton value="rag">RAG</ToggleButton>
-            <ToggleButton value="agent">Agent</ToggleButton>
-          </ToggleButtonGroup>
-
           <Button
             variant="outlined"
             onClick={handleIndexCodebase}
@@ -117,6 +110,10 @@ export default function AIAssistantDrawer({ open, onClose, onDisableAssistant })
           >
             {isIndexing ? "Indexing..." : "Index Codebase"}
           </Button>
+
+          {indexMessage && (
+            <Alert severity="success" sx={{ py: 0.5 }}>{indexMessage}</Alert>
+          )}
 
           <Divider />
 
@@ -134,48 +131,72 @@ export default function AIAssistantDrawer({ open, onClose, onDisableAssistant })
             onClick={handleAsk}
             disabled={isAsking}
           >
-            {isAsking
-              ? "Asking..."
-              : `Ask AI (${askMode === "agent" ? "Agent" : "RAG"})`}
+            {isAsking ? "Asking..." : "Ask AI"}
           </Button>
 
           <Button color="error" variant="text" onClick={onDisableAssistant}>
             Disable AI Assistant
           </Button>
 
-          {(isIndexing || isAsking) && (
+          {isAsking && (
             <Box display="flex" alignItems="center" gap={1}>
               <CircularProgress size={18} />
-              <Typography variant="body2">Processing...</Typography>
+              <Typography variant="body2" color="text.secondary">
+                Thinking...
+              </Typography>
             </Box>
           )}
 
           {errorMessage && <Alert severity="error">{errorMessage}</Alert>}
 
-          {answer && (
-            <Box sx={{ p: 1.5, border: "1px solid", borderColor: "divider", borderRadius: 1.5 }}>
-              <Typography variant="subtitle2" mb={1}>
-                Answer
-              </Typography>
-              <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                {answer}
-              </Typography>
-            </Box>
-          )}
+          {parsedAnswer && (
+            <Stack spacing={1.5}>
+              {/* Answer bullets */}
+              <Box sx={{ p: 1.5, border: "1px solid", borderColor: "divider", borderRadius: 1.5 }}>
+                <Typography variant="subtitle2" mb={1}>Answer</Typography>
+                <Stack spacing={0.5}>
+                  {parsedAnswer.answer.map((point, i) => (
+                    <Typography key={i} variant="body2">
+                      • {point}
+                    </Typography>
+                  ))}
+                </Stack>
+              </Box>
 
-          {sources.length > 0 && (
-            <Box>
-              <Typography variant="subtitle2" mb={1}>
-                Sources
-              </Typography>
-              <Stack spacing={0.75}>
-                {sources.map((source, index) => (
-                  <Typography key={`${source.filePath}-${index}`} variant="caption" color="text.secondary">
-                    {source.filePath} (chunk {source.chunkIndex})
-                  </Typography>
-                ))}
-              </Stack>
-            </Box>
+              {/* Code pointers */}
+              {parsedAnswer.codePointers.length > 0 && (
+                <Box sx={{ p: 1.5, border: "1px solid", borderColor: "divider", borderRadius: 1.5 }}>
+                  <Typography variant="subtitle2" mb={1}>Code Pointers</Typography>
+                  <Stack spacing={0.75}>
+                    {parsedAnswer.codePointers.map((pointer, i) => (
+                      <Box key={i}>
+                        <Typography
+                          variant="caption"
+                          sx={{ fontFamily: "monospace", color: "primary.main" }}
+                        >
+                          {pointer.file}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {" "}— {pointer.reason}
+                        </Typography>
+                      </Box>
+                    ))}
+                  </Stack>
+                </Box>
+              )}
+
+              {/* Confidence badge */}
+              <Box display="flex" alignItems="center" gap={1}>
+                <Chip
+                  label={parsedAnswer.confidence}
+                  color={CONFIDENCE_COLORS[parsedAnswer.confidence] || "default"}
+                  size="small"
+                />
+                <Typography variant="caption" color="text.secondary">
+                  {parsedAnswer.confidenceReason}
+                </Typography>
+              </Box>
+            </Stack>
           )}
         </Stack>
       </Box>

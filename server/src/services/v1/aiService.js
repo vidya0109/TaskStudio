@@ -1,52 +1,18 @@
-import fs from "fs/promises";
-import path from "path";
 import {
   generateAgentDecision,
-  generateAgentFinalAnswer,
-  generateGroundedAnswer,
-  streamAgentFinalAnswer,
-  streamGroundedAnswer
+  streamAgentFinalAnswer
 } from "../llmService.js";
 import { embedMany, embedQuery, getEmbeddingModelName } from "../embeddingService.js";
-import { fileURLToPath } from "url";
+import { fetchRepoFiles, fetchFileContent,fetchCommits } from "../githubService.js";
 import pool from "../../config/db.js";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const PROJECT_ROOT = path.resolve(__dirname, "../../../../");
-const SCAN_DIRS = [
-  path.join(PROJECT_ROOT, "client/src"),
-  path.join(PROJECT_ROOT, "server/src")
-];
-const ALLOWED_EXTENSIONS = new Set([".js", ".jsx", ".ts", ".tsx", ".json", ".md"]);
+import env from "../../config/env.js";
 const RETRIEVAL_CANDIDATE_LIMIT = 20;
 const FINAL_CONTEXT_LIMIT = 5;
 const AGENT_MAX_STEPS = 3;
 
 // ---------------------------------------------------------------------------
-// File walking + chunking
+// Chunking
 // ---------------------------------------------------------------------------
-
-async function walkFiles(dirPath, fileList = []) {
-  const entries = await fs.readdir(dirPath, { withFileTypes: true });
-
-  for (const entry of entries) {
-    const fullPath = path.join(dirPath, entry.name);
-
-    if (entry.isDirectory()) {
-      await walkFiles(fullPath, fileList);
-      continue;
-    }
-
-    const ext = path.extname(entry.name);
-    if (ALLOWED_EXTENSIONS.has(ext)) {
-      fileList.push(fullPath);
-    }
-  }
-
-  return fileList;
-}
 
 function toChunks(content, filePath, chunkSize = 1200) {
   const chunks = [];
@@ -148,29 +114,17 @@ async function getRankedChunks({ question, limit = FINAL_CONTEXT_LIMIT }) {
 // ---------------------------------------------------------------------------
 
 export async function buildCodeIndex() {
-  const allFiles = [];
-
-  for (const dir of SCAN_DIRS) {
-    try {
-      const files = await walkFiles(dir);
-      allFiles.push(...files);
-    } catch {
-      // Ignore missing directories during early setup.
-    }
-  }
+  const filePaths = await fetchRepoFiles();
+  console.log(`GitHub: found ${filePaths.length} files to index`);
 
   const indexedFiles = [];
   const allChunks = [];
 
-  for (const filePath of allFiles) {
-    try {
-      const content = await fs.readFile(filePath, "utf-8");
-      const relativePath = path.relative(PROJECT_ROOT, filePath);
-      indexedFiles.push(relativePath);
-      allChunks.push(...toChunks(content, relativePath));
-    } catch {
-      // Ignore unreadable files.
-    }
+  for (const filePath of filePaths) {
+    const content = await fetchFileContent(filePath);
+    if (!content) continue;
+    indexedFiles.push(filePath);
+    allChunks.push(...toChunks(content, filePath));
   }
 
   const chunkTexts = allChunks.map((chunk) => chunk.text);
@@ -215,100 +169,18 @@ export async function buildCodeIndex() {
 }
 
 // ---------------------------------------------------------------------------
-// RAG — non-streaming
-// ---------------------------------------------------------------------------
-
-export async function askFromCodeIndex(question) {
-  const normalizedQuestion = String(question || "").trim();
-
-  if (!normalizedQuestion) {
-    return { answer: "Please provide a non-empty question.", sources: [] };
-  }
-
-  if (!(await hasIndexedChunks())) {
-    return {
-      answer: "No indexed chunks found. Run POST /api/ai/index first.",
-      sources: []
-    };
-  }
-
-  const ranked = await getRankedChunks({ question: normalizedQuestion });
-
-  if (ranked.length === 0) {
-    return {
-      answer:
-        "I could not find relevant code for this question in the current index. Try rephrasing or re-indexing.",
-      sources: []
-    };
-  }
-
-  const sources = ranked.map((chunk) => ({
-    filePath: chunk.filePath,
-    chunkIndex: chunk.chunkIndex
-  }));
-
-  console.log("AI service: invoking LLM with ranked chunks:", ranked.length);
-  const answer = await generateGroundedAnswer({
-    question: normalizedQuestion,
-    contextChunks: ranked
-  });
-
-  return { answer, sources };
-}
-
-// ---------------------------------------------------------------------------
-// RAG — streaming
-// ---------------------------------------------------------------------------
-
-export async function askFromCodeIndexStream(question, onToken) {
-  const normalizedQuestion = String(question || "").trim();
-
-  if (!normalizedQuestion) {
-    return { answer: "Please provide a non-empty question.", sources: [] };
-  }
-
-  if (!(await hasIndexedChunks())) {
-    return {
-      answer: "No indexed chunks found. Run POST /api/ai/index first.",
-      sources: []
-    };
-  }
-
-  const ranked = await getRankedChunks({ question: normalizedQuestion });
-
-  if (ranked.length === 0) {
-    return {
-      answer:
-        "I could not find relevant code for this question. Try rephrasing or re-indexing.",
-      sources: []
-    };
-  }
-
-  const sources = ranked.map((chunk) => ({
-    filePath: chunk.filePath,
-    chunkIndex: chunk.chunkIndex
-  }));
-
-  const answer = await streamGroundedAnswer({
-    question: normalizedQuestion,
-    contextChunks: ranked,
-    onToken
-  });
-  return { answer, sources };
-}
-
-// ---------------------------------------------------------------------------
 // Agent helpers
 // ---------------------------------------------------------------------------
 
 function summarizeToolResult(toolName, result) {
   if (toolName === "semantic_search") {
+    if (!result.length) return "semantic_search returned no results.";
     return `semantic_search returned ${result.length} chunks:\n${result
       .map(
         (chunk, idx) =>
-          `${idx + 1}. ${chunk.filePath}#${chunk.chunkIndex} (score ${chunk.score.toFixed(3)})`
+          `--- chunk ${idx + 1}: ${chunk.filePath}#${chunk.chunkIndex} (score ${chunk.score.toFixed(3)}) ---\n${String(chunk.text || "").slice(0, 600)}`
       )
-      .join("\n")}`;
+      .join("\n\n")}`;
   }
   if (toolName === "read_source" && result) {
     return `read_source returned ${result.filePath}#${result.chunkIndex}:\n${String(
@@ -317,6 +189,17 @@ function summarizeToolResult(toolName, result) {
   }
   return `${toolName} returned no data`;
 }
+
+function summarizeCommits(commits) {
+  if (!commits || commits.length === 0) {
+    return "github_commits returned no commits.";
+  }
+  const lines = commits.map(
+    (c) => `- [${c.sha}] ${c.date.slice(0, 10)} ${c.author}: ${c.message}`
+  );
+  return `github_commits returned ${commits.length} commits:\n${lines.join("\n")}`;
+}
+
 
 async function fetchChunkByCoords(filePath, chunkIndex) {
   const { rows } = await pool.query(
@@ -332,7 +215,6 @@ async function fetchChunkByCoords(filePath, chunkIndex) {
 async function runAgentLoop(question, onToken) {
   const evidence = [];
   const sourcesMap = new Map();
-  const streaming = typeof onToken === "function";
 
   for (let step = 1; step <= AGENT_MAX_STEPS; step += 1) {
     const scratchpad = evidence.map((e, i) => `Step ${i + 1}: ${e}`).join("\n\n");
@@ -340,26 +222,14 @@ async function runAgentLoop(question, onToken) {
 
     if (decision?.action === "final") {
       const evidenceText = evidence.join("\n\n");
-      const answer =
-        decision?.finalAnswer?.trim() ||
-        (streaming
-          ? await streamAgentFinalAnswer({ question, evidenceText, onToken })
-          : await generateAgentFinalAnswer({ question, evidenceText }));
-
-      if (decision?.finalAnswer?.trim() && streaming) {
-        onToken(decision.finalAnswer.trim());
-      }
-
+      const answer = await streamAgentFinalAnswer({ question, evidenceText, onToken });
       return { answer, sources: Array.from(sourcesMap.values()) };
     }
 
     if (decision?.toolName === "semantic_search") {
       const toolQuery = String(decision?.toolArgs?.query || question).trim();
       const topK = Math.min(Math.max(Number(decision?.toolArgs?.topK || 6), 1), 10);
-      const ranked = await getRankedChunks({
-        question: toolQuery || question,
-        limit: topK
-      });
+      const ranked = await getRankedChunks({ question: toolQuery || question, limit: topK });
       for (const chunk of ranked) {
         const key = `${chunk.filePath}#${chunk.chunkIndex}`;
         if (!sourcesMap.has(key)) {
@@ -384,35 +254,23 @@ async function runAgentLoop(question, onToken) {
       continue;
     }
 
+    if (decision?.toolName === "github_commits") {
+      const perPage = Math.min(Math.max(Number(decision?.toolArgs?.perPage || 50), 1), 100);
+      const commits = await fetchCommits(env.githubRepo, env.githubBranch, perPage);
+      evidence.push(summarizeCommits(commits));
+      continue;
+    }
+
     evidence.push("Planner returned an unknown action. Proceeding to final answer.");
     break;
   }
 
-  const answer = streaming
-    ? await streamAgentFinalAnswer({ question, evidenceText: evidence.join("\n\n"), onToken })
-    : await generateAgentFinalAnswer({ question, evidenceText: evidence.join("\n\n") });
-
+  const answer = await streamAgentFinalAnswer({
+    question,
+    evidenceText: evidence.join("\n\n"),
+    onToken
+  });
   return { answer, sources: Array.from(sourcesMap.values()) };
-}
-
-// ---------------------------------------------------------------------------
-// Agent — non-streaming
-// ---------------------------------------------------------------------------
-
-export async function askFromCodeIndexAgent(question) {
-  const normalizedQuestion = String(question || "").trim();
-  if (!normalizedQuestion) {
-    return { answer: "Please provide a non-empty question.", sources: [] };
-  }
-
-  if (!(await hasIndexedChunks())) {
-    return {
-      answer: "No indexed chunks found. Run POST /api/ai/index first.",
-      sources: []
-    };
-  }
-
-  return runAgentLoop(normalizedQuestion, null);
 }
 
 // ---------------------------------------------------------------------------

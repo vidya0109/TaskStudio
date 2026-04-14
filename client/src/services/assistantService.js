@@ -2,38 +2,20 @@ import httpClient from "./http/httpClient";
 import { API_BASE_URL } from "../utils/env";
 
 const INDEX_TIMEOUT_MS = 120000;
-const ASK_TIMEOUT_MS = 30000;
-const AGENT_TIMEOUT_MS = 90000;
 
 export async function indexCodebase() {
   const { data } = await httpClient.post("/ai/index", {}, { timeout: INDEX_TIMEOUT_MS });
   return data;
 }
 
-export async function askCodebase(question) {
-  const { data } = await httpClient.post("/ai/ask", { question }, { timeout: ASK_TIMEOUT_MS });
-  return data;
-}
-
-export async function askCodebaseAgent(question) {
-  const { data } = await httpClient.post(
-    "/ai/agent",
-    { question },
-    { timeout: AGENT_TIMEOUT_MS }
-  );
-  return data;
-}
-
 export async function streamAskCodebase({
   question,
-  mode,
   onToken,
   onSources,
   onDone,
   onError
 }) {
-  const endpoint = mode === "agent" ? "/ai/agent/stream" : "/ai/ask/stream";
-  const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+  const response = await fetch(`${API_BASE_URL}/ai/agent/stream`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -52,9 +34,8 @@ export async function streamAskCodebase({
 
   while (true) {
     const { value, done } = await reader.read();
-    if (done) {
-      break;
-    }
+    if (done) break;
+
     buffer += decoder.decode(value, { stream: true });
 
     let boundary = buffer.indexOf("\n\n");
@@ -65,9 +46,7 @@ export async function streamAskCodebase({
 
       const eventMatch = frame.match(/^event:\s*(.+)$/m);
       const dataMatch = frame.match(/^data:\s*(.+)$/m);
-      if (!eventMatch || !dataMatch) {
-        continue;
-      }
+      if (!eventMatch || !dataMatch) continue;
 
       const event = eventMatch[1].trim();
       let payload = {};
